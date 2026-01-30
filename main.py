@@ -35,7 +35,8 @@ states = {}
 # Helper: Получить данные аккаунта из строки 3
 def get_account_data():
     row = accounts_sheet.row_values(3)
-    phone = row[1] if len(row) > 1 else None  # B3
+    phone_raw = row[1] if len(row) > 1 else None  # B3
+    phone = '+' + phone_raw if phone_raw and not phone_raw.startswith('+') else phone_raw  # Добавляем + если отсутствует
     api_id = int(row[3]) if len(row) > 3 else None  # D3
     api_hash = row[4] if len(row) > 4 else None  # E3
     session_path = row[5] if len(row) > 5 else None  # F3
