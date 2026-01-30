@@ -10,6 +10,8 @@ import gspread
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.errors import ChannelPrivateError, InviteHashExpiredError, UserAlreadyParticipantError
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -194,8 +196,22 @@ async def join_and_parse(event, data):
     client_session = data['client']
     channel_link = data['channel_link']
     try:
-        channel = await client_session.get_entity(channel_link)
-        await client_session(JoinChannelRequest(channel))
+        try:
+            channel = await client_session.get_entity(channel_link)
+        except ChannelPrivateError:
+            if '/+' not in channel_link:
+                raise
+            hash_ = channel_link.split('/+')[-1]
+            result = await client_session(ImportChatInviteRequest(hash=hash_))
+            channel = result.chats[0]
+            logger.debug(f"Joined private channel via invite: {channel_link}")
+
+        # If needed, join public with JoinChannelRequest, but get_entity often suffices
+        try:
+            await client_session(JoinChannelRequest(channel))
+        except UserAlreadyParticipantError:
+            pass  # Already joined
+
         await event.reply('Вступил в канал, начинаю парсить последние 5 постов с задержкой 10-15 сек')
         logger.debug(f"Joined channel {channel_link}")
 
@@ -259,11 +275,17 @@ async def join_and_parse(event, data):
         num_posts = len(posts)
         await event.reply(f'{num_posts} постов успешно сохранены в таблицу' if num_posts != 1 else '1 пост успешно сохранен в таблицу')
 
-    except errors.ChannelPrivateError:
-        await event.reply('Ошибка: Канал приватный и требует заявки.')
+    except InviteHashExpiredError:
+        await event.reply('Ошибка: Ссылка-приглашение истекла.')
+
+    except UserAlreadyParticipantError:
+        channel = await client_session.get_entity(channel_link)
+        # Continue with parsing
+
     except Exception as e:
         logger.error(f"Join/parse error: {str(e)}")
         await event.reply(f'Ошибка: {str(e)}')
+
     finally:
         del states[event.sender_id]
         await client_session.disconnect()
