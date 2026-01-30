@@ -3,12 +3,16 @@ import json
 import os
 import random
 import string
+import logging
 from google.cloud import storage
 from google.oauth2 import service_account
 import gspread
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Константы (hardcoded на основе ваших уточнений)
 SHEET_ID = '1J0sqjlhZ4uSLuo8sA48sEcEXRD4NZDwDMabu6wz0kKo'
@@ -40,6 +44,7 @@ def get_account_data():
     api_id = int(row[3]) if len(row) > 3 else None  # D3
     api_hash = row[4] if len(row) > 4 else None  # E3
     session_path = row[5] if len(row) > 5 else None  # F3
+    logger.debug(f"Loaded account data: phone={phone}, api_id={api_id}, api_hash={api_hash[:5]}..., session_path={session_path}")
     return phone, api_id, api_hash, session_path
 
 # Helper: Рандомное имя сессии (16 цифр .session)
@@ -62,9 +67,15 @@ BOT_TOKEN = os.environ['BOT_TOKEN']
 phone, api_id, api_hash, _ = get_account_data()
 client = TelegramClient(None, api_id, api_hash)
 
+@client.on(events.NewMessage(pattern='/start'))
+async def handle_start(event):
+    logger.debug(f"Received /start from user {event.sender_id}")
+    await event.reply('Привет! Я готов к работе. Используйте /newpars для парсинга.')
+
 @client.on(events.NewMessage(pattern='/newpars'))
 async def start_newpars(event):
     user_id = event.sender_id
+    logger.debug(f"Received /newpars from user {user_id}")
     states[user_id] = {'state': 'waiting_link', 'data': {}, 'waiter': asyncio.Event()}
     await event.reply('Введите ссылку на Telegram канал.')
 
@@ -76,6 +87,7 @@ async def handle_message(event):
     state = states[user_id]['state']
     data = states[user_id]['data']
     waiter = states[user_id]['waiter']
+    logger.debug(f"Handling message in state {state} for user {user_id}")
 
     try:
         if state == 'waiting_link':
@@ -97,6 +109,7 @@ async def handle_message(event):
             waiter.set()
 
     except Exception as e:
+        logger.error(f"Error handling message: {str(e)}")
         await event.reply(f'Ошибка: {str(e)}')
         del states[user_id]
 
@@ -104,13 +117,20 @@ async def authorize_account(event, data):
     phone, api_id, api_hash, session_path = get_account_data()
     session_str = None
     if session_path:
-        blob = bucket.blob(session_path.split('/')[-1])
-        session_str = blob.download_as_string().decode('utf-8')
+        try:
+            blob = bucket.blob(session_path.split('/')[-1])
+            session_str = blob.download_as_string().decode('utf-8')
+            logger.debug("Loaded session from GCS")
+        except Exception as e:
+            logger.error(f"Error loading session: {str(e)}")
+            session_path = None  # Fallback to new
     client_session = TelegramClient(StringSession(session_str), api_id, api_hash) if session_str else TelegramClient(StringSession(), api_id, api_hash)
 
     try:
         await client_session.connect()
+        logger.debug("Client session connected")
         if not await client_session.is_user_authorized():
+            logger.debug("Sending code request")
             await client_session.send_code_request(phone)
             states[event.sender_id]['state'] = 'waiting_code'
             await event.reply('Введите код для авторизации.')
@@ -157,6 +177,7 @@ async def authorize_account(event, data):
             full_path = upload_to_gcs('/tmp/session.temp', gcs_name)
             os.remove('/tmp/session.temp')
             accounts_sheet.update_cell(3, 6, full_path)  # F3
+            logger.debug(f"Saved new session to {full_path}")
 
         await event.reply('Аккаунт авторизован. Приступаю к работе.')
         data['client'] = client_session
@@ -164,6 +185,7 @@ async def authorize_account(event, data):
         await join_and_parse(event, data)
 
     except Exception as e:
+        logger.error(f"Auth error: {str(e)}")
         await event.reply(f'Ошибка авторизации: {str(e)}. Создаю новую сессию.')
         accounts_sheet.update_cell(3, 6, '')  # Очистить F3
         await authorize_account(event, data)  # Retry
@@ -175,6 +197,7 @@ async def join_and_parse(event, data):
         channel = await client_session.get_entity(channel_link)
         await client_session(JoinChannelRequest(channel))
         await event.reply('Вступил в канал, начинаю парсить последние 5 постов с задержкой 10-15 сек')
+        logger.debug(f"Joined channel {channel_link}")
 
         posts = []
         async for message in client_session.iter_messages(channel, limit=50, reverse=True):
@@ -239,13 +262,16 @@ async def join_and_parse(event, data):
     except errors.ChannelPrivateError:
         await event.reply('Ошибка: Канал приватный и требует заявки.')
     except Exception as e:
+        logger.error(f"Join/parse error: {str(e)}")
         await event.reply(f'Ошибка: {str(e)}')
     finally:
         del states[event.sender_id]
         await client_session.disconnect()
 
 async def main():
+    logger.info("Starting bot...")
     await client.start(bot_token=BOT_TOKEN)
+    logger.info("Bot started successfully")
     await client.run_until_disconnected()
 
 asyncio.run(main())
