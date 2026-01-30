@@ -1,0 +1,4 @@
+telethon==1.42.0
+gspread==6.2.1
+google-cloud-storage==3.8.0
+google-auth==2.48.0
