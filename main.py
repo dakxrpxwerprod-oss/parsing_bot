@@ -13,7 +13,7 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.errors import ChannelPrivateError, InviteHashExpiredError, UserAlreadyParticipantError
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Константы (hardcoded на основе ваших уточнений)
@@ -57,7 +57,7 @@ def random_session_name():
 def upload_to_gcs(local_path, gcs_name):
     blob = bucket.blob(gcs_name)
     blob.upload_from_filename(local_path)
-    return f'gs://{BUCKET_NAME}/{gcs_name}'
+    return f'{BUCKET_NAME}/{gcs_name}'
 
 # Helper: Рандомное имя медиа (7 букв _ номер .ext)
 def random_media_name(number, ext):
@@ -120,9 +120,10 @@ async def authorize_account(event, data):
     session_str = None
     if session_path:
         try:
-            blob = bucket.blob(session_path.split('/')[-1])
+            blob_name = session_path.split('/', 1)[-1] if '/' in session_path else session_path
+            blob = bucket.blob(blob_name)
             session_str = blob.download_as_string().decode('utf-8')
-            logger.debug("Loaded session from GCS")
+            logger.info("Loaded session from GCS")
         except Exception as e:
             logger.error(f"Error loading session: {str(e)}")
             session_path = None  # Fallback to new
@@ -130,9 +131,9 @@ async def authorize_account(event, data):
 
     try:
         await client_session.connect()
-        logger.debug("Client session connected")
+        logger.info("Client session connected")
         if not await client_session.is_user_authorized():
-            logger.debug("Sending code request")
+            logger.info("Sending code request")
             await client_session.send_code_request(phone)
             states[event.sender_id]['state'] = 'waiting_code'
             await event.reply('Введите код для авторизации.')
@@ -173,13 +174,13 @@ async def authorize_account(event, data):
 
         if not session_path:
             session_name = random_session_name()
-            gcs_name = f'sessions/{session_name}'  # Подпапка для сессий
+            gcs_name = f'sessions/{session_name}'
             with open('/tmp/session.temp', 'w') as f:
                 f.write(client_session.session.save())
             full_path = upload_to_gcs('/tmp/session.temp', gcs_name)
             os.remove('/tmp/session.temp')
-            accounts_sheet.update_cell(3, 6, full_path)  # F3
-            logger.debug(f"Saved new session to {full_path}")
+            accounts_sheet.update_cell(3, 6, full_path)
+            logger.info(f"Saved new session to {full_path}")
 
         await event.reply('Аккаунт авторизован. Приступаю к работе.')
         data['client'] = client_session
@@ -198,22 +199,23 @@ async def join_and_parse(event, data):
     try:
         try:
             channel = await client_session.get_entity(channel_link)
-        except ChannelPrivateError:
-            if '/+' not in channel_link:
+        except ValueError as ve:
+            if "No user has" in str(ve) or "The username is not occupied" in str(ve):
+                hash_ = channel_link.split('/')[-1].lstrip('+')
+                result = await client_session(ImportChatInviteRequest(hash=hash_))
+                channel = result.chats[0]
+                logger.info(f"Joined private channel via hash: {hash_}")
+            else:
                 raise
-            hash_ = channel_link.split('/+')[-1]
-            result = await client_session(ImportChatInviteRequest(hash=hash_))
-            channel = result.chats[0]
-            logger.debug(f"Joined private channel via invite: {channel_link}")
 
-        # If needed, join public with JoinChannelRequest, but get_entity often suffices
+        # Join if not already
         try:
             await client_session(JoinChannelRequest(channel))
         except UserAlreadyParticipantError:
-            pass  # Already joined
+            pass
 
         await event.reply('Вступил в канал, начинаю парсить последние 5 постов с задержкой 10-15 сек')
-        logger.debug(f"Joined channel {channel_link}")
+        logger.info(f"Joined channel {channel_link}")
 
         posts = []
         async for message in client_session.iter_messages(channel, limit=50, reverse=True):
@@ -277,10 +279,6 @@ async def join_and_parse(event, data):
 
     except InviteHashExpiredError:
         await event.reply('Ошибка: Ссылка-приглашение истекла.')
-
-    except UserAlreadyParticipantError:
-        channel = await client_session.get_entity(channel_link)
-        # Continue with parsing
 
     except Exception as e:
         logger.error(f"Join/parse error: {str(e)}")
