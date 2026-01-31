@@ -178,7 +178,7 @@ async def join_and_parse(event, data):
         try:
             channel = await client_session.get_entity(channel_link)
         except ValueError as ve:
-            if "No user has" in str(ve) or "The username is not occupied" in str(ve) or "not part of" in str(ve):
+            if "No user has" in str(ve) or "The username is not occupied" in str(ve) or "not part of" in str(ve) or "Cannot find any entity" in str(ve):
                 hash_ = channel_link.split('/')[-1].lstrip('+')
                 result = await client_session(ImportChatInviteRequest(hash=hash_))
                 if not result.chats:
