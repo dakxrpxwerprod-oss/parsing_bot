@@ -207,7 +207,7 @@ async def join_and_parse(event, data):
         await event.reply('Вступил в канал, начинаю парсить последние 5 постов с задержкой 10-15 сек')
         logger.info(f"Joined channel {channel_link}")
         posts = []
-        async for message in client_session.iter_messages(channel, limit=50, reverse=True):
+        async for message in client_session.iter_messages(channel, limit=50, reverse=False):
             if message.reply_markup:  # Skip posts with buttons
                 continue
             if not message.text and not message.photo and not message.video:
