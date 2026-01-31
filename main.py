@@ -4,6 +4,7 @@ import os
 import random
 import string
 import logging
+import re
 from google.cloud import storage
 from google.oauth2 import service_account
 import gspread
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Константы (hardcoded на основе ваших уточнений)
 SHEET_ID = '1J0sqjlhZ4uSLuo8sA48sEcEXRD4NZDwDMabu6wz0kKo'
 BUCKET_NAME = 'maneralabservice_source'
-TIMEOUT = 60  # сек на ввод
+TIMEOUT = 60 # сек на ввод
 
 # Инициализация Google clients (GOOGLE_JSON из env)
 credentials = service_account.Credentials.from_service_account_info(
@@ -41,11 +42,11 @@ states = {}
 # Helper: Получить данные аккаунта из строки 3
 def get_account_data():
     row = accounts_sheet.row_values(3)
-    phone_raw = row[1] if len(row) > 1 else None  # B3
-    phone = '+' + phone_raw if phone_raw and not phone_raw.startswith('+') else phone_raw  # Добавляем + если отсутствует
-    api_id = int(row[3]) if len(row) > 3 else None  # D3
-    api_hash = row[4] if len(row) > 4 else None  # E3
-    session_path = row[5] if len(row) > 5 else None  # F3
+    phone_raw = row[1] if len(row) > 1 else None # B3
+    phone = '+' + phone_raw if phone_raw and not phone_raw.startswith('+') else phone_raw # Добавляем + если отсутствует
+    api_id = int(row[3]) if len(row) > 3 else None # D3
+    api_hash = row[4] if len(row) > 4 else None # E3
+    session_path = row[5] if len(row) > 5 else None # F3
     logger.debug(f"Loaded account data: phone={phone}, api_id={api_id}, api_hash={api_hash[:5]}..., session_path={session_path}")
     return phone, api_id, api_hash, session_path
 
@@ -90,7 +91,6 @@ async def handle_message(event):
     data = states[user_id]['data']
     waiter = states[user_id]['waiter']
     logger.debug(f"Handling message in state {state} for user {user_id}")
-
     try:
         if state == 'waiting_link':
             link = event.message.text.strip()
@@ -101,15 +101,12 @@ async def handle_message(event):
             await event.reply('Начинаю проверку каналов.')
             states[user_id]['state'] = 'auth'
             await authorize_account(event, data)
-
         elif state == 'waiting_code':
             data['code'] = event.message.text.strip()
             waiter.set()
-
         elif state == 'waiting_2fa':
             data['password'] = event.message.text.strip()
             waiter.set()
-
     except Exception as e:
         logger.error(f"Error handling message: {str(e)}")
         await event.reply(f'Ошибка: {str(e)}')
@@ -126,9 +123,8 @@ async def authorize_account(event, data):
             logger.info("Loaded session from GCS")
         except Exception as e:
             logger.error(f"Error loading session: {str(e)}")
-            session_path = None  # Fallback to new
+            session_path = None # Fallback to new
     client_session = TelegramClient(StringSession(session_str), api_id, api_hash) if session_str else TelegramClient(StringSession(), api_id, api_hash)
-
     try:
         await client_session.connect()
         logger.info("Client session connected")
@@ -171,7 +167,6 @@ async def authorize_account(event, data):
                     return
                 code = data.get('code')
                 await client_session.sign_in(phone, code)
-
         if not session_path:
             session_name = random_session_name()
             gcs_name = f'sessions/{session_name}'
@@ -181,18 +176,15 @@ async def authorize_account(event, data):
             os.remove('/tmp/session.temp')
             accounts_sheet.update_cell(3, 6, full_path)
             logger.info(f"Saved new session to {full_path}")
-
         await event.reply('Аккаунт авторизован. Приступаю к работе.')
         data['client'] = client_session
         states[event.sender_id]['state'] = 'join_channel'
         await join_and_parse(event, data)
-
     except Exception as e:
         logger.error(f"Auth error: {str(e)}")
-        await event.reply(f'Ошибка авторизации: {str(e)}. Создаю новую сессию.')
-        accounts_sheet.update_cell(3, 6, '')  # Очистить F3
-        await authorize_account(event, data)  # Retry
-
+        await event.reply(f'Ошибка: {str(e)}. Создаю новую сессию.')
+        accounts_sheet.update_cell(3, 6, '') # Очистить F3
+        await authorize_account(event, data) # Retry
 async def join_and_parse(event, data):
     client_session = data['client']
     channel_link = data['channel_link']
@@ -207,56 +199,60 @@ async def join_and_parse(event, data):
                 logger.info(f"Joined private channel via hash: {hash_}")
             else:
                 raise
-
         # Join if not already
         try:
             await client_session(JoinChannelRequest(channel))
         except UserAlreadyParticipantError:
             pass
-
         await event.reply('Вступил в канал, начинаю парсить последние 5 постов с задержкой 10-15 сек')
         logger.info(f"Joined channel {channel_link}")
-
         posts = []
         async for message in client_session.iter_messages(channel, limit=50, reverse=True):
+            if message.reply_markup:  # Skip posts with buttons
+                continue
             if not message.text and not message.photo and not message.video:
                 continue
             if message.grouped_id:
                 group_text = []
+                group_entities = []
                 group_media = []
                 async for msg in client_session.iter_messages(channel, ids=message.id, add_offset=-10, limit=20):
                     if msg.grouped_id == message.grouped_id:
                         if msg.text:
                             group_text.append(msg.text)
+                            if msg.entities:
+                                # Adjust offsets for joined text
+                                offset_adjust = sum(len(t) + 1 for t in group_text[:-1])  # +1 for \n
+                                for ent in msg.entities:
+                                    ent.offset += offset_adjust
+                                group_entities.extend(msg.entities)
                         if msg.photo or msg.video:
                             group_media.append(msg)
                 text = '\n'.join(group_text)
                 if not text:
                     continue
+                text = clean_text(text, group_entities)  # Clean links
                 posts.append({'message': message, 'text': text, 'media': group_media})
             else:
                 if not message.text:
                     continue
                 media = [message] if (message.photo or message.video) and not message.document else []
                 if not media and message.document:
-                    continue  # Пропустить если только документ
-                posts.append({'message': message, 'text': message.text, 'media': media})
-
+                    continue # Пропустить если только документ
+                text = clean_text(message.text, message.entities)  # Clean links
+                posts.append({'message': message, 'text': text, 'media': media})
             if len(posts) >= 5:
                 break
             await asyncio.sleep(random.uniform(10, 15))
-
         last_row = len(posts_sheet.col_values(1)) + 1
         if last_row < 3:
             last_row = 3
-
         for post in posts:
             msg = post['message']
             channel_username = channel.username if channel.username else f'c/{str(channel.id)[4:]}'
             post_link = f'https://t.me/{channel_username}/{msg.id}'
             text = post['text']
             media_paths = []
-
             for i, media_msg in enumerate(post['media'], 1):
                 ext = 'mp4' if media_msg.video else 'jpg'
                 local_path = f'/tmp/media_{i}.{ext}'
@@ -266,32 +262,38 @@ async def join_and_parse(event, data):
                 media_paths.append(gcs_path)
                 os.remove(local_path)
                 await asyncio.sleep(random.uniform(10, 15))
-
-            row_data = [channel_link, post_link, text] + [''] * 11  # A-C + D (empty) + E-N (10)
+            row_data = [channel_link, post_link, text] + [''] * 11 # A-C + D (empty) + E-N (10)
             for j, path in enumerate(media_paths[:10]):
-                row_data[4 + j] = path  # E= index 4 (0-based)
-
+                row_data[4 + j] = path # E= index 4 (0-based)
             posts_sheet.append_row(row_data, table_range=f'A{last_row}')
             last_row += 1
-
         num_posts = len(posts)
         await event.reply(f'{num_posts} постов успешно сохранены в таблицу' if num_posts != 1 else '1 пост успешно сохранен в таблицу')
-
     except InviteHashExpiredError:
         await event.reply('Ошибка: Ссылка-приглашение истекла.')
-
     except Exception as e:
         logger.error(f"Join/parse error: {str(e)}")
         await event.reply(f'Ошибка: {str(e)}')
-
     finally:
         del states[event.sender_id]
         await client_session.disconnect()
-
+def clean_text(text, entities):
+    if not entities:
+        # Fallback regex for plain links
+        text = re.sub(r'(?:https?://)?(?:t\.me/|telegram\.me/|@)[a-zA-Z0-9_+/]+', '', text)
+        return text.strip()
+    # Rebuild text without internal links (remove substring)
+    offset_shift = 0
+    for entity in sorted(entities, key=lambda e: e.offset):
+        if hasattr(entity, 'url') and (entity.url.startswith('https://t.me/') or entity.url.startswith('t.me/') or entity.url.startswith('telegram.me/') or entity.url.startswith('@')):
+            start = entity.offset - offset_shift
+            end = start + entity.length
+            text = text[:start] + text[end:]
+            offset_shift += entity.length
+    return text.strip()
 async def main():
     logger.info("Starting bot...")
     await client.start(bot_token=BOT_TOKEN)
     logger.info("Bot started successfully")
     await client.run_until_disconnected()
-
 asyncio.run(main())
