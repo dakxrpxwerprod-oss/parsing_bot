@@ -13,15 +13,12 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.errors import ChannelPrivateError, InviteHashExpiredError, UserAlreadyParticipantError
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 # Константы (hardcoded на основе ваших уточнений)
 SHEET_ID = '1J0sqjlhZ4uSLuo8sA48sEcEXRD4NZDwDMabu6wz0kKo'
 BUCKET_NAME = 'maneralabservice_source'
 TIMEOUT = 60 # сек на ввод
-
 # Инициализация Google clients (GOOGLE_JSON из env)
 credentials = service_account.Credentials.from_service_account_info(
     json.loads(os.environ['GOOGLE_JSON']),
@@ -30,15 +27,12 @@ credentials = service_account.Credentials.from_service_account_info(
 gs_client = gspread.authorize(credentials)
 gcs_client = storage.Client(credentials=credentials)
 bucket = gcs_client.bucket(BUCKET_NAME)
-
 # Доступ к Sheets
 sheet = gs_client.open_by_key(SHEET_ID)
 accounts_sheet = sheet.worksheet('accounts')
 posts_sheet = sheet.worksheet('Pars_posts')
-
 # State: user_id -> {'state': str, 'data': dict, 'waiter': asyncio.Event}
 states = {}
-
 # Helper: Получить данные аккаунта из строки 3
 def get_account_data():
     row = accounts_sheet.row_values(3)
@@ -49,39 +43,32 @@ def get_account_data():
     session_path = row[5] if len(row) > 5 else None # F3
     logger.debug(f"Loaded account data: phone={phone}, api_id={api_id}, api_hash={api_hash[:5]}..., session_path={session_path}")
     return phone, api_id, api_hash, session_path
-
 # Helper: Рандомное имя сессии (16 цифр .session)
 def random_session_name():
     return ''.join(random.choices(string.digits, k=16)) + '.session'
-
 # Helper: Загрузка в GCS
 def upload_to_gcs(local_path, gcs_name):
     blob = bucket.blob(gcs_name)
     blob.upload_from_filename(local_path)
     return f'{BUCKET_NAME}/{gcs_name}'
-
 # Helper: Рандомное имя медиа (7 букв _ номер .ext)
 def random_media_name(number, ext):
     letters = ''.join(random.choices(string.ascii_lowercase, k=7))
     return f'{letters}_{number}.{ext}'
-
 # Telethon client (bot)
 BOT_TOKEN = os.environ['BOT_TOKEN']
 phone, api_id, api_hash, _ = get_account_data()
 client = TelegramClient(None, api_id, api_hash)
-
 @client.on(events.NewMessage(pattern='/start'))
 async def handle_start(event):
     logger.debug(f"Received /start from user {event.sender_id}")
     await event.reply('Привет! Я готов к работе. Используйте /newpars для парсинга.')
-
 @client.on(events.NewMessage(pattern='/newpars'))
 async def start_newpars(event):
     user_id = event.sender_id
     logger.debug(f"Received /newpars from user {user_id}")
     states[user_id] = {'state': 'waiting_link', 'data': {}, 'waiter': asyncio.Event()}
     await event.reply('Введите ссылку на Telegram канал.')
-
 @client.on(events.NewMessage)
 async def handle_message(event):
     user_id = event.sender_id
@@ -111,7 +98,6 @@ async def handle_message(event):
         logger.error(f"Error handling message: {str(e)}")
         await event.reply(f'Ошибка: {str(e)}')
         del states[user_id]
-
 async def authorize_account(event, data):
     phone, api_id, api_hash, session_path = get_account_data()
     session_str = None
@@ -208,7 +194,7 @@ async def join_and_parse(event, data):
         logger.info(f"Joined channel {channel_link}")
         posts = []
         async for message in client_session.iter_messages(channel, limit=50, reverse=False):
-            if message.reply_markup:  # Skip posts with buttons
+            if message.reply_markup: # Skip posts with buttons
                 continue
             if not message.text and not message.photo and not message.video:
                 continue
@@ -222,25 +208,26 @@ async def join_and_parse(event, data):
                             group_text.append(msg.text)
                             if msg.entities:
                                 # Adjust offsets for joined text
-                                offset_adjust = sum(len(t) + 1 for t in group_text[:-1])  # +1 for \n
+                                offset_adjust = sum(len(t) + 1 for t in group_text[:-1]) # +1 for \n
                                 for ent in msg.entities:
                                     ent.offset += offset_adjust
                                 group_entities.extend(msg.entities)
                         if msg.photo or msg.video:
                             group_media.append(msg)
-                text = '\n'.join(group_text)
-                if not text:
+                original_text = '\n'.join(group_text)
+                if not original_text:
                     continue
-                text = clean_text(text, group_entities)  # Clean links
-                posts.append({'message': message, 'text': text, 'media': group_media})
+                cleaned_text = clean_text(original_text, group_entities) # Clean links
+                posts.append({'message': message, 'original_text': original_text, 'cleaned_text': cleaned_text, 'media': group_media})
             else:
                 if not message.text:
                     continue
                 media = [message] if (message.photo or message.video) and not message.document else []
                 if not media and message.document:
                     continue # Пропустить если только документ
-                text = clean_text(message.text, message.entities)  # Clean links
-                posts.append({'message': message, 'text': text, 'media': media})
+                original_text = message.text
+                cleaned_text = clean_text(original_text, message.entities) # Clean links
+                posts.append({'message': message, 'original_text': original_text, 'cleaned_text': cleaned_text, 'media': media})
             if len(posts) >= 5:
                 break
             await asyncio.sleep(random.uniform(10, 15))
@@ -251,7 +238,8 @@ async def join_and_parse(event, data):
             msg = post['message']
             channel_username = channel.username if channel.username else f'c/{str(channel.id)[4:]}'
             post_link = f'https://t.me/{channel_username}/{msg.id}'
-            text = post['text']
+            original_text = post['original_text']
+            cleaned_text = post['cleaned_text']
             media_paths = []
             for i, media_msg in enumerate(post['media'], 1):
                 ext = 'mp4' if media_msg.video else 'jpg'
@@ -262,7 +250,7 @@ async def join_and_parse(event, data):
                 media_paths.append(gcs_path)
                 os.remove(local_path)
                 await asyncio.sleep(random.uniform(10, 15))
-            row_data = [channel_link, post_link, text] + [''] * 11 # A-C + D (empty) + E-N (10)
+            row_data = [channel_link, post_link, original_text, cleaned_text] + [''] * 10 # A-D + E-N (10)
             for j, path in enumerate(media_paths[:10]):
                 row_data[4 + j] = path # E= index 4 (0-based)
             posts_sheet.append_row(row_data, table_range=f'A{last_row}')
