@@ -181,6 +181,9 @@ async def join_and_parse(event, data):
             if "No user has" in str(ve) or "The username is not occupied" in str(ve) or "not part of" in str(ve):
                 hash_ = channel_link.split('/')[-1].lstrip('+')
                 result = await client_session(ImportChatInviteRequest(hash=hash_))
+                if not result.chats:
+                    await event.reply('Канал требует одобрения заявки администратора. Пропускаем.')
+                    return
                 channel = result.chats[0]
                 logger.info(f"Joined private channel via hash: {hash_}")
             else:
